@@ -7,7 +7,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;800&family=Source+Sans+3:wght@400;600;700;800&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/13.2.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/13.2.0/firebase-database-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
 :root{
@@ -205,12 +206,7 @@ const ROUNDS = [
     refs:"CCC 464, 469" }
 ];
 
-const PREFIX = "belen-ohgame-v1-";
-const PEER_OPTS = { config: { iceServers: [
-  { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302", "stun:stun.cloudflare.com:3478"] },
-  { urls: ["turn:eu-0.turn.peerjs.com:3478", "turn:us-0.turn.peerjs.com:3478"], username: "peerjs", credential: "peerjsp" },
-  { urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443", "turns:openrelay.metered.ca:443?transport=tcp"], username: "openrelayproject", credential: "openrelayproject" }
-] } };
+const FIREBASE = { databaseURL: "https://orthodoxy-or-heresy-default-rtdb.firebaseio.com", projectId: "orthodoxy-or-heresy" };
 const WORD = {O:"Orthodox", H:"Heresy"};
 const $app = document.getElementById("app");
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -228,142 +224,126 @@ function titleFor(pct){
 }
 function baseURL(){ return location.href.split("#")[0].split("?")[0]; }
 
-/* ============================ HOST ============================ */
-const H = { peer:null, code:null, phase:"lobby", round:-1, players:{}, kicked:[], conns:{},
-            timerSec:20, autoReveal:true, qStart:0, deadline:0, tick:null, showAll:false, retries:0 };
+/* ---------- Firebase ---------- */
+let db = null, clockOffset = 0, online = true;
+function fbInit(){
+  if (db) return true;
+  if (typeof firebase === "undefined") return false;
+  firebase.initializeApp(FIREBASE);
+  db = firebase.database();
+  db.ref(".info/serverTimeOffset").on("value", s => { clockOffset = s.val() || 0; });
+  db.ref(".info/connected").on("value", s => { online = !!s.val(); showBanner(!online && (!!H.ref || P.joined)); if (online && P.joined) markOnline(); });
+  return true;
+}
+const now = () => Date.now() + clockOffset;
+const gameRef = code => db.ref("games/" + code);
+function noEngine(){ $app.innerHTML = `<div class="center"><h2>Couldn’t load the game.</h2><p class="muted">Check the internet connection and reload the page.</p><button class="btn" onclick="location.reload()">Reload</button></div>`; }
+function showBanner(on){
+  let b = document.getElementById("banner");
+  if (on && !b){ b = document.createElement("div"); b.id="banner"; b.className="banner"; b.textContent="Reconnecting…"; document.body.prepend(b); }
+  if (!on && b) b.remove();
+}
 
-function hostSave(){
-  const players = {};
-  for (const [k,p] of Object.entries(H.players)) players[k] = {pid:p.pid,name:p.name,votes:p.votes};
-  store.set("oh_host", {code:H.code, phase:H.phase, round:H.round, players, kicked:H.kicked,
-    timerSec:H.timerSec, autoReveal:H.autoReveal, deadline:H.deadline, qStart:H.qStart, saved:Date.now()});
+/* ---------- shared scoring (host and players compute the same thing) ---------- */
+function buildPlayers(rawPlayers, rawVotes){
+  const out = {};
+  for (const [pid, p] of Object.entries(rawPlayers || {})) out[pid] = {pid, name: p.name || "Player", online: !!p.online, votes:{}};
+  for (const [r, byPid] of Object.entries(rawVotes || {})) for (const [pid, v] of Object.entries(byPid || {})) if (out[pid] && v) out[pid].votes[r] = {c: v.c === "O" ? "O" : "H", ms: +v.ms || 0};
+  return out;
 }
-function hostBegin(resume){
-  if (typeof Peer === "undefined"){ $app.innerHTML = `<div class="center"><h2>Couldn’t load the game engine.</h2><p class="muted">Check the internet connection and reload.</p></div>`; return; }
-  if (resume){
-    Object.assign(H, {code:resume.code, phase:resume.phase, round:resume.round, kicked:resume.kicked||[],
-      timerSec:resume.timerSec, autoReveal:resume.autoReveal, deadline:resume.deadline, qStart:resume.qStart});
-    H.players = {};
-    for (const [k,p] of Object.entries(resume.players||{})) H.players[k] = {...p, online:false};
-  } else {
-    H.code = String(Math.floor(1000 + Math.random()*9000));
-  }
-  $app.innerHTML = `<div class="center"><div class="spin"></div><p class="muted">Opening game room…</p></div>`;
-  openHostPeer(!!resume);
-}
-function openHostPeer(resuming){
-  const peer = new Peer(PREFIX + H.code, PEER_OPTS);
-  H.peer = peer;
-  peer.on("open", () => { H.retries = 0; hostSave(); renderHost(); startTick(); });
-  peer.on("connection", conn => {
-    conn.on("data", m => onHostMsg(conn, m));
-    conn.on("close", () => { if (conn.pid && H.conns[conn.pid] === conn){ delete H.conns[conn.pid]; const p=H.players[conn.pid]; if(p) p.online=false; renderHost(); } });
-  });
-  peer.on("disconnected", () => { try{ peer.reconnect(); }catch(e){} });
-  peer.on("error", e => {
-    if (e.type === "unavailable-id"){
-      peer.destroy();
-      if (resuming && H.retries < 8){ H.retries++; setTimeout(() => openHostPeer(true), 2500); }
-      else if (!resuming){ H.code = String(Math.floor(1000 + Math.random()*9000)); openHostPeer(false); }
-      else { $app.innerHTML = `<div class="center"><h2>Couldn’t reopen game ${H.code}.</h2><button class="btn" onclick="store.del('oh_host');location.reload()">Start a new game</button></div>`; }
-    } else if (e.type === "network" || e.type === "server-error" || e.type === "socket-error"){
-      setTimeout(() => { try{ peer.reconnect(); }catch(_){} }, 2000);
-    }
-  });
-}
-function onHostMsg(conn, m){
-  if (!m || typeof m !== "object") return;
-  if (m.t === "join"){
-    const pid = String(m.pid||"").replace(/[^a-z0-9]/gi,"").slice(0,40); if (!pid) return;
-    if (H.kicked.includes(pid)){ conn.send({t:"kicked"}); setTimeout(()=>conn.close(),300); return; }
-    let p = H.players[pid];
-    if (!p){
-      let name = String(m.name||"").replace(/\s+/g," ").trim().slice(0,18) || "Player";
-      const taken = new Set(Object.values(H.players).map(x=>x.name.toLowerCase()));
-      let n = name, i = 2; while (taken.has(n.toLowerCase())) n = name + " " + (i++);
-      p = H.players[pid] = {pid, name:n, votes:{}};
-    }
-    const old = H.conns[pid]; if (old && old !== conn){ try{ old.close(); }catch(e){} }
-    conn.pid = pid; H.conns[pid] = conn; p.online = true;
-    sendState(pid); hostSave(); renderHost();
-  } else if (m.t === "vote"){
-    const p = H.players[conn.pid]; if (!p) return;
-    if (H.phase !== "question" || m.round !== H.round || p.votes[H.round]) { sendState(conn.pid); return; }
-    p.votes[H.round] = {c: m.c === "O" ? "O" : "H", ms: Date.now() - H.qStart};
-    sendState(conn.pid); hostSave();
-    const online = Object.values(H.players).filter(x => x.online);
-    if (H.autoReveal && online.length && online.every(x => x.votes[H.round])) hostReveal();
-    else renderHost(true);
-  }
-}
-function revealedCount(){ return (H.phase === "reveal" || H.phase === "final") ? H.round + 1 : Math.max(0, H.round); }
-function scoreOf(p){
-  let o=0,h=0,miss=0,ms=0; const n = revealedCount();
+function revealed(phase, round){ return (phase === "reveal" || phase === "final") ? round + 1 : Math.max(0, round); }
+function scoreOf(p, phase = H.phase, round = H.round){
+  let o=0,h=0,miss=0,ms=0; const n = revealed(phase, round);
   for (let i=0;i<n;i++){
     const v = p.votes[i];
-    if (!v) { miss++; continue; }
+    if (!v){ miss++; continue; }
     ms += v.ms;
     if (v.c === ROUNDS[i].answer) o++; else h++;
   }
   return {o,h,miss,ms,played:n};
 }
-function ranked(){
-  return Object.values(H.players).map(p => ({p, s:scoreOf(p)}))
+function rankList(players, phase, round){
+  return Object.values(players).map(p => ({p, s:scoreOf(p, phase, round)}))
     .sort((a,b) => b.s.o - a.s.o || a.s.h - b.s.h || a.s.ms - b.s.ms);
 }
-function stateFor(pid){
-  const p = H.players[pid]; const s = scoreOf(p);
-  const st = {t:"state", phase:H.phase, round:H.round, total:ROUNDS.length, name:p.name, score:s};
-  if (H.phase === "question" || H.phase === "reveal"){
-    const r = ROUNDS[H.round];
-    st.title = r.title; st.statement = r.statement;
-    st.myVote = p.votes[H.round] ? p.votes[H.round].c : null;
-    if (H.phase === "question") st.secondsLeft = H.timerSec ? Math.max(0, Math.ceil((H.deadline - Date.now())/1000)) : null;
-    if (H.phase === "reveal"){ st.answer = r.answer; st.label = r.label; st.trap = r.trap; st.refs = r.refs; }
-  }
-  if (H.phase === "final"){
-    const list = ranked(); st.place = list.findIndex(x => x.p.pid === pid) + 1; st.of = list.length;
-  }
-  return st;
-}
-function sendState(pid){ const c = H.conns[pid]; if (c && c.open){ try{ c.send(stateFor(pid)); }catch(e){} } }
-function broadcast(){ for (const pid of Object.keys(H.conns)) sendState(pid); }
 
+/* ============================ HOST ============================ */
+const H = { ref:null, code:null, phase:"lobby", round:-1, timerSec:20, autoReveal:true, qStart:0, deadline:0,
+            players:{}, raw:{players:{}, votes:{}}, tick:null, showAll:false, ready:false };
+function ranked(){ return rankList(H.players, H.phase, H.round); }
+function setMeta(patch){ Object.assign(H, patch); return H.ref.child("meta").update({...patch, updated: firebase.database.ServerValue.TIMESTAMP}); }
+
+async function hostBegin(resumeCode){
+  if (!fbInit()) return noEngine();
+  $app.innerHTML = `<div class="center"><div class="spin"></div><p class="muted">Opening game room…</p></div>`;
+  try{
+    if (resumeCode){
+      H.code = resumeCode; H.ref = gameRef(H.code);
+      const m = (await H.ref.child("meta").get()).val();
+      if (!m) { store.del("oh_host"); return hostBegin(null); }
+      Object.assign(H, {phase:m.phase, round:m.round, timerSec:m.timerSec, autoReveal:m.autoReveal, qStart:m.qStart||0, deadline:m.deadline||0});
+    } else {
+      let code = null;
+      for (let i = 0; i < 15 && !code; i++){
+        const c = String(Math.floor(1000 + Math.random()*9000));
+        const m = (await gameRef(c).child("meta").get()).val();
+        if (!m || now() - (m.updated || 0) > 6*3600*1000) code = c;
+      }
+      if (!code) throw new Error("no free code");
+      H.code = code; H.ref = gameRef(code);
+      await Promise.all(["players","kicked","votes"].map(k => H.ref.child(k).remove()));
+      await setMeta({phase:"lobby", round:-1, timerSec:H.timerSec, autoReveal:H.autoReveal, qStart:0, deadline:0});
+    }
+  }catch(e){
+    $app.innerHTML = `<div class="center"><h2>Couldn’t open the game room.</h2><p class="muted">${esc(e.message||e)}</p><button class="btn" onclick="location.reload()">Try again</button></div>`;
+    return;
+  }
+  store.set("oh_host", {code:H.code, saved:Date.now()});
+  H.ref.child("players").on("value", s => { H.raw.players = s.val() || {}; hostData(); });
+  H.ref.child("votes").on("value", s => { H.raw.votes = s.val() || {}; hostData(); });
+  H.ready = true; renderHost(); startTick();
+}
+function hostData(){
+  H.players = buildPlayers(H.raw.players, H.raw.votes);
+  if (!H.ready) return;
+  if (H.phase === "question"){
+    const on = Object.values(H.players).filter(p => p.online);
+    if (H.autoReveal && on.length && on.every(p => p.votes[H.round])) return hostReveal();
+    renderHost(true);
+  } else if (H.phase === "lobby" || H.phase === "final") renderHost();
+}
 function hostNext(){
   if (H.phase === "lobby" || H.phase === "reveal"){
-    if (H.round + 1 >= ROUNDS.length){ H.phase = "final"; }
-    else { H.round++; H.phase = "question"; H.qStart = Date.now(); H.deadline = H.timerSec ? Date.now() + H.timerSec*1000 : 0; }
-  } else if (H.phase === "question"){ return hostReveal(); }
-  hostSave(); broadcast(); renderHost();
+    if (H.round + 1 >= ROUNDS.length) setMeta({phase:"final"});
+    else { const t = now(); setMeta({phase:"question", round:H.round + 1, qStart:t, deadline: H.timerSec ? t + H.timerSec*1000 : 0}); }
+    store.set("oh_host", {code:H.code, saved:Date.now()});
+    renderHost();
+  } else if (H.phase === "question") hostReveal();
 }
-function hostReveal(){ if (H.phase !== "question") return; H.phase = "reveal"; hostSave(); broadcast(); renderHost(); }
+function hostReveal(){ if (H.phase !== "question") return; setMeta({phase:"reveal"}); renderHost(); }
 function startTick(){
   clearInterval(H.tick);
   H.tick = setInterval(() => {
     if (H.phase !== "question" || !H.timerSec) return;
-    const left = Math.max(0, (H.deadline - Date.now())/1000);
+    const left = Math.max(0, (H.deadline - now())/1000);
     const t = document.getElementById("timer");
     if (t){ t.style.setProperty("--p", (left / H.timerSec * 100) + "%"); t.firstElementChild.textContent = Math.ceil(left); }
     if (left <= 0) hostReveal();
   }, 200);
 }
 function kick(pid){
-  const p = H.players[pid]; if (!p) return;
-  H.kicked.push(pid); delete H.players[pid];
-  const c = H.conns[pid]; if (c){ try{ c.send({t:"kicked"}); }catch(e){} setTimeout(()=>{ try{c.close()}catch(e){} },300); delete H.conns[pid]; }
-  hostSave(); renderHost();
+  H.ref.child("kicked/" + pid).set(true);
+  H.ref.child("players/" + pid).remove();
 }
-function hostEnd(){ if (!confirmBox("End this game and start fresh?")) return; }
+function hostEnd(){ confirmBox("End this game and start fresh?"); }
 function confirmBox(msg){
-  // inline confirm (native confirm is unreliable in some frames)
   const d = document.createElement("div");
   d.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:9";
   d.innerHTML = `<div class="card" style="max-width:420px;text-align:center"><h3 style="margin-top:0">${esc(msg)}</h3>
     <div style="display:flex;gap:12px;justify-content:center"><button class="btn ghost" style="color:var(--navy);border-color:var(--navy)" id="cbNo">Cancel</button><button class="btn" id="cbYes">Yes</button></div></div>`;
   document.body.appendChild(d);
   d.querySelector("#cbNo").onclick = () => d.remove();
-  d.querySelector("#cbYes").onclick = () => { d.remove(); store.del("oh_host"); try{H.peer.destroy()}catch(e){} location.href = baseURL() + "#host"; location.reload(); };
-  return false;
+  d.querySelector("#cbYes").onclick = () => { d.remove(); store.del("oh_host"); location.href = baseURL() + "#host"; location.reload(); };
 }
 
 function hostBar(){
@@ -376,21 +356,21 @@ function hostBar(){
 function renderHost(light){
   if (H.phase === "lobby") return renderLobby();
   if (H.phase === "question"){
+    const all = Object.values(H.players);
+    const nV = all.filter(p => p.votes[H.round]).length, nT = all.filter(p => p.online || p.votes[H.round]).length;
     if (light && document.getElementById("answeredN")){
-      const online = Object.values(H.players);
-      document.getElementById("answeredN").textContent = online.filter(p => p.votes[H.round]).length;
-      document.getElementById("answeredT").textContent = online.filter(p=>p.online || p.votes[H.round]).length;
+      document.getElementById("answeredN").textContent = nV;
+      document.getElementById("answeredT").textContent = nT;
       return;
     }
     const r = ROUNDS[H.round];
-    const all = Object.values(H.players);
     $app.innerHTML = hostBar() + `<div class="wrap" style="flex:1;display:flex;flex-direction:column;justify-content:center">
       <div class="roundtag">Round ${H.round+1} · ${esc(r.title)}</div>
       <div class="card" style="margin-top:14px"><div class="statement">${esc(r.statement)}</div></div>
       <div class="choices"><div class="choice o">✝ Orthodox</div><div class="choice h">🛑 Heresy</div></div>
       <div class="qfoot">
         ${H.timerSec ? `<div class="timer" id="timer"><span>${H.timerSec}</span></div>` : `<div></div>`}
-        <div class="answered"><b id="answeredN">${all.filter(p=>p.votes[H.round]).length}</b> / <span id="answeredT">${all.filter(p=>p.online||p.votes[H.round]).length}</span> voted</div>
+        <div class="answered"><b id="answeredN">${nV}</b> / <span id="answeredT">${nT}</span> voted</div>
         <button class="btn" onclick="hostReveal()">Reveal answer ▸</button>
       </div></div>`;
     return;
@@ -414,9 +394,9 @@ function renderLobby(){
       <p class="muted" style="margin:0 0 14px">Tap ✕ to remove a name.</p>
       <div class="players">${ps.length ? ps.map(p => `<span class="pchip ${p.online?"":"off"}">${esc(p.name)}<button onclick="kick('${p.pid}')" aria-label="Remove">✕</button></span>`).join("") : `<span class="muted">Waiting for players…</span>`}</div>
       <div class="settings">
-        <label>Timer <select id="tsel" onchange="H.timerSec=+this.value;hostSave()">
+        <label>Timer <select id="tsel" onchange="setMeta({timerSec:+this.value})">
           ${[0,15,20,30,45,60].map(s=>`<option value="${s}" ${s===H.timerSec?"selected":""}>${s?s+" sec":"No timer"}</option>`).join("")}</select></label>
-        <label><input type="checkbox" style="width:auto" ${H.autoReveal?"checked":""} onchange="H.autoReveal=this.checked;hostSave()"> Reveal when everyone has voted</label>
+        <label><input type="checkbox" style="width:auto" ${H.autoReveal?"checked":""} onchange="setMeta({autoReveal:this.checked})"> Reveal when everyone has voted</label>
       </div>
       <button class="btn" style="font-size:1.4rem;padding:18px 40px" ${ps.length?"":"disabled"} onclick="hostNext()">Start game ▸</button>
     </div></div></div>`;
@@ -450,7 +430,6 @@ function renderFinal(){
   let O=0, Hh=0; list.forEach(x => { O += x.s.o; Hh += x.s.h; });
   const tot = Math.max(1, O+Hh), pct = Math.round(O/tot*100);
   const cls = titleFor(pct);
-  // the trap that fooled the most
   let worst = -1, worstN = -1;
   ROUNDS.forEach((r,i) => { const n = Object.values(H.players).filter(p => p.votes[i] && p.votes[i].c !== r.answer).length; if (n > worstN){ worstN = n; worst = i; } });
   const allH = ROUNDS.every(r => r.answer === "H"); const nOrth = ROUNDS.filter(r => r.answer === "O").length;
@@ -482,12 +461,12 @@ function copyResults(btn){
 }
 function fallbackCopy(t,done){ const a=document.createElement("textarea"); a.value=t; document.body.appendChild(a); a.select(); try{document.execCommand("copy"); done();}catch(e){} a.remove(); }
 document.addEventListener("keydown", e => {
-  if (!H.peer || e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (!H.ready || e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
   if (e.key === " " || e.key === "ArrowRight"){ e.preventDefault(); if (H.phase === "lobby" && !Object.keys(H.players).length) return; if (H.phase !== "final") hostNext(); }
 });
 
 /* ============================ PLAYER ============================ */
-const P = { peer:null, conn:null, pid:null, name:"", code:"", st:null, joined:false, kicked:false, cd:null, deadline:0, pending:null };
+const P = { ref:null, pid:null, name:"", code:"", meta:null, raw:{players:{}, votes:{}}, st:null, stKey:"", joined:false, kicked:false, cd:null, jt:null, pendingVote:null };
 
 function playerStart(){
   P.pid = store.get("oh_pid"); if (!P.pid){ P.pid = "p" + Math.random().toString(36).slice(2) + Date.now().toString(36); store.set("oh_pid", P.pid); }
@@ -511,69 +490,83 @@ function playerStart(){
   </div>`;
   if (code && name && last.code === code) doJoin();
 }
-function doJoin(){
-  const code = document.getElementById("jcode").value.trim(), name = document.getElementById("jname").value.trim();
-  const err = document.getElementById("jerr");
+function jStatus(t){ const e = document.getElementById("jstat"); if (e) e.textContent = t; }
+function joinFail(msg){
+  clearTimeout(P.jt);
+  const b = document.getElementById("jbtn"); if (b){ b.disabled=false; b.textContent="Join game"; }
+  jStatus(""); const er = document.getElementById("jerr"); if (er) er.textContent = msg;
+}
+async function doJoin(){
+  const code = document.getElementById("jcode").value.trim();
+  let name = document.getElementById("jname").value.replace(/\s+/g," ").trim().slice(0,18);
+  const err = document.getElementById("jerr"); err.textContent = "";
   if (!/^\d{4}$/.test(code)) { err.textContent = "Enter the 4-digit code on the board."; return; }
   if (name.length < 2) { err.textContent = "Enter your name."; return; }
-  if (typeof Peer === "undefined"){ err.textContent = "Couldn’t load the game — check Wi-Fi and reload."; return; }
-  P.code = code; P.name = name; store.set("oh_last", {code, name});
-  document.getElementById("jbtn").disabled = true; err.textContent = "";
-  document.getElementById("jbtn").textContent = "Joining…";
-  if (P.peer) { try{ P.peer.destroy(); }catch(e){} }
-  P.peer = new Peer(PEER_OPTS);
-  jStatus("Connecting to game server…");
-  clearTimeout(P.jt); P.jt = setTimeout(joinTimeout, 25000);
-  P.peer.on("open", playerConnect);
-  P.peer.on("disconnected", () => { try{ P.peer.reconnect(); }catch(e){} });
-  P.peer.on("error", e => {
-    if (e.type === "peer-unavailable"){
-      if (P.joined){ setTimeout(playerConnect, 2500); return; }
-      const b = document.getElementById("jbtn"); if (b){ b.disabled=false; b.textContent="Join game"; }
-      jStatus(""); clearTimeout(P.jt); const er = document.getElementById("jerr"); if (er) er.textContent = "No game found with code " + P.code + ". Check the board.";
-    } else if (!P.joined){
-      const b = document.getElementById("jbtn"); if (b){ b.disabled=false; b.textContent="Join game"; }
-      jStatus(""); clearTimeout(P.jt); const er = document.getElementById("jerr"); if (er) er.textContent = "Connection problem (" + e.type + "). Try again.";
-    } else setTimeout(playerConnect, 2500);
-  });
+  if (!fbInit()) { err.textContent = "Couldn’t load the game — check the internet and reload."; return; }
+  const b = document.getElementById("jbtn"); b.disabled = true; b.textContent = "Joining…";
+  jStatus("Connecting…");
+  clearTimeout(P.jt); P.jt = setTimeout(() => joinFail("Couldn’t connect. Check that you’re online and try again."), 20000);
+  try{
+    const ref = gameRef(code);
+    const meta = (await ref.child("meta").get()).val();
+    if (!meta) return joinFail("No game found with code " + code + ". Check the board.");
+    if ((await ref.child("kicked/" + P.pid).get()).val()) return joinFail("You were removed from this game. Ask your teacher.");
+    jStatus("Joining game " + code + "…");
+    const players = (await ref.child("players").get()).val() || {};
+    if (players[P.pid]) name = players[P.pid].name;
+    else {
+      const taken = new Set(Object.entries(players).map(([k,p]) => (p.name||"").toLowerCase()));
+      let n = name, i = 2; while (taken.has(n.toLowerCase())) n = name + " " + (i++);
+      name = n;
+    }
+    P.ref = ref; P.code = code; P.name = name;
+    store.set("oh_last", {code, name: document.getElementById("jname").value.trim()});
+    await ref.child("players/" + P.pid).set({name, online:true});
+    P.joined = true; clearTimeout(P.jt);
+    markOnline();
+    ref.child("meta").on("value", s => { P.meta = s.val(); playerUpdate(); });
+    ref.child("players").on("value", s => { P.raw.players = s.val() || {}; playerUpdate(); });
+    ref.child("votes").on("value", s => { P.raw.votes = s.val() || {}; playerUpdate(); });
+    ref.child("kicked/" + P.pid).on("value", s => { if (s.val()) playerKicked(); });
+  }catch(e){ joinFail("Connection problem: " + (e.message || e)); }
 }
-function jStatus(t){ const e = document.getElementById("jstat"); if (e) e.textContent = t; }
-function joinTimeout(){
-  if (P.joined) return;
-  const b = document.getElementById("jbtn"); if (b){ b.disabled=false; b.textContent="Try again"; }
-  jStatus("");
-  const er = document.getElementById("jerr"); if (er) er.textContent = "Couldn’t reach the board. Check the code, make sure you’re online, and try again.";
-  try{ P.peer.destroy(); }catch(e){}
+function markOnline(){
+  if (!P.ref || P.kicked) return;
+  const r = P.ref.child("players/" + P.pid);
+  r.child("online").onDisconnect().set(false);
+  r.update({name:P.name, online:true});
 }
-function playerConnect(){
-  if (P.kicked) return;
-  if (!P.joined) jStatus("Found the server — connecting to game " + P.code + "…");
-  if (P.conn) { try{ P.conn.close(); }catch(e){} }
-  const conn = P.peer.connect(PREFIX + P.code, {reliable:true});
-  P.conn = conn;
-  conn.on("open", () => { conn.send({t:"join", name:P.name, pid:P.pid}); if (P.pending){ conn.send(P.pending); } });
-  conn.on("data", onPlayerMsg);
-  conn.on("close", () => { if (P.conn !== conn || P.kicked) return; if (P.joined){ showBanner(true); setTimeout(playerConnect, 2000); } });
+function playerKicked(){
+  P.kicked = true; store.del("oh_last");
+  try{ P.ref.child("players/" + P.pid).onDisconnect().cancel(); P.ref.off(); }catch(e){}
+  $app.innerHTML = `<div class="center"><h2>You were removed from the game.</h2><p class="muted">Ask your teacher, then join again with your real name.</p><button class="btn" onclick="location.reload()">Back</button></div>`;
 }
-function onPlayerMsg(m){
-  if (!m) return;
-  if (m.t === "kicked"){ P.kicked = true; store.del("oh_last"); $app.innerHTML = `<div class="center"><h2>You were removed from the game.</h2><p class="muted">Ask your teacher, then join again with your real name.</p><button class="btn" onclick="location.reload()">Back</button></div>`; return; }
-  if (m.t !== "state") return;
-  P.joined = true; clearTimeout(P.jt); P.st = m; showBanner(false);
-  if (P.pending && (m.round !== P.pending.round || m.myVote || m.phase !== "question")) P.pending = null;
-  if (m.phase === "question" && m.secondsLeft != null) P.deadline = Date.now() + m.secondsLeft*1000;
-  renderPlayer();
-}
-function showBanner(on){
-  let b = document.getElementById("banner");
-  if (on && !b){ b = document.createElement("div"); b.id="banner"; b.className="banner"; b.textContent="Reconnecting…"; document.body.prepend(b); }
-  if (!on && b) b.remove();
+function playerUpdate(){
+  if (!P.meta || P.kicked) return;
+  const players = buildPlayers(P.raw.players, P.raw.votes);
+  const me = players[P.pid] || {pid:P.pid, name:P.name, votes:{}};
+  if (P.pendingVote && P.pendingVote.round === P.meta.round && !me.votes[P.meta.round]) me.votes[P.meta.round] = {c:P.pendingVote.c, ms:0};
+  const m = P.meta, st = {phase:m.phase, round:m.round, total:ROUNDS.length, name:me.name, score:scoreOf(me, m.phase, m.round)};
+  if ((m.phase === "question" || m.phase === "reveal") && !ROUNDS[m.round]) return;
+  if (m.phase === "question" || m.phase === "reveal"){
+    const r = ROUNDS[m.round];
+    st.title = r.title; st.statement = r.statement;
+    st.myVote = me.votes[m.round] ? me.votes[m.round].c : null;
+    st.timed = !!m.timerSec;
+    if (m.phase === "reveal"){ st.answer = r.answer; st.label = r.label; st.trap = r.trap; st.refs = r.refs; }
+  }
+  if (m.phase === "final"){
+    const list = rankList(players, m.phase, m.round); st.place = list.findIndex(x => x.p.pid === P.pid) + 1; st.of = list.length;
+  }
+  const key = JSON.stringify(st);
+  if (key === P.stKey) return;
+  P.stKey = key; P.st = st; renderPlayer();
 }
 function pVote(c){
   const st = P.st; if (!st || st.phase !== "question" || st.myVote) return;
-  P.pending = {t:"vote", round:st.round, c};
-  st.myVote = c; renderPlayer();
-  try{ P.conn.send(P.pending); }catch(e){}
+  P.pendingVote = {round: st.round, c};
+  P.ref.child("votes/" + st.round + "/" + P.pid).set({c, ms: Math.max(0, now() - (P.meta.qStart || now()))}).catch(()=>{});
+  playerUpdate();
 }
 function renderPlayer(){
   const st = P.st; clearInterval(P.cd);
@@ -586,7 +579,7 @@ function renderPlayer(){
     if (!st.myVote){
       body = `<div class="pstate"><div class="roundtag" style="text-align:center">${esc(st.title)}</div>
         <div class="pstatement">${esc(st.statement)}</div>
-        ${st.secondsLeft!=null?`<div style="text-align:center;font-weight:800;font-size:1.3rem" id="pcd"></div>`:""}
+        ${st.timed?`<div style="text-align:center;font-weight:800;font-size:1.3rem" id="pcd"></div>`:""}
         <div class="pbtns"><button class="pbtn o" onclick="pVote('O')">✝ Orthodox<small>True Catholic teaching</small></button>
         <button class="pbtn h" onclick="pVote('H')">🛑 Heresy<small>A trap!</small></button></div></div>`;
     } else {
@@ -614,8 +607,8 @@ function renderPlayer(){
       <p style="font-size:1.2rem">Place: <b>${st.place}</b> of ${st.of}</p></div>`;
   }
   $app.innerHTML = `<div class="pscreen">${top}${body}</div>`;
-  if (st.phase === "question" && !st.myVote && st.secondsLeft != null){
-    const upd = () => { const el = document.getElementById("pcd"); if (!el) return; const s = Math.max(0, Math.ceil((P.deadline-Date.now())/1000)); el.textContent = "⏱ " + s + "s"; };
+  if (st.phase === "question" && !st.myVote && st.timed){
+    const upd = () => { const el = document.getElementById("pcd"); if (!el || !P.meta) return; const s = Math.max(0, Math.ceil((P.meta.deadline - now())/1000)); el.textContent = "⏱ " + s + "s"; };
     upd(); P.cd = setInterval(upd, 250);
   }
 }
@@ -624,13 +617,13 @@ function renderPlayer(){
 function boot(){
   if (location.hash === "#host"){
     const saved = store.get("oh_host");
-    if (saved && saved.phase !== "final" && Date.now() - (saved.saved||0) < 6*3600*1000){
+    if (saved && saved.code && Date.now() - (saved.saved||0) < 6*3600*1000){
       $app.innerHTML = `<div class="center"><div class="logo" style="font-size:3rem;margin-bottom:20px"><span class="o">Orthodoxy</span> or <span class="h">Heresy?</span></div>
-        <div class="card" style="max-width:460px"><h3 style="margin-top:0">Game ${esc(saved.code)} is still in progress</h3>
-        <p>${Object.keys(saved.players||{}).length} players · ${saved.phase==="lobby"?"in the lobby":"round "+(saved.round+1)}</p>
+        <div class="card" style="max-width:460px"><h3 style="margin-top:0">Game ${esc(saved.code)} may still be going</h3>
+        <p>Pick up where you left off, or start a fresh game with a new code.</p>
         <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap"><button class="btn" id="bRes">Resume it</button>
         <button class="btn ghost" style="color:var(--navy);border-color:var(--navy)" id="bNew">Start new game</button></div></div></div>`;
-      document.getElementById("bRes").onclick = () => hostBegin(saved);
+      document.getElementById("bRes").onclick = () => hostBegin(saved.code);
       document.getElementById("bNew").onclick = () => { store.del("oh_host"); hostBegin(null); };
     } else hostBegin(null);
   } else playerStart();
