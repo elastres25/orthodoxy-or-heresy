@@ -206,6 +206,11 @@ const ROUNDS = [
 ];
 
 const PREFIX = "belen-ohgame-v1-";
+const PEER_OPTS = { config: { iceServers: [
+  { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302", "stun:stun.cloudflare.com:3478"] },
+  { urls: ["turn:eu-0.turn.peerjs.com:3478", "turn:us-0.turn.peerjs.com:3478"], username: "peerjs", credential: "peerjsp" },
+  { urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443", "turns:openrelay.metered.ca:443?transport=tcp"], username: "openrelayproject", credential: "openrelayproject" }
+] } };
 const WORD = {O:"Orthodox", H:"Heresy"};
 const $app = document.getElementById("app");
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -247,7 +252,7 @@ function hostBegin(resume){
   openHostPeer(!!resume);
 }
 function openHostPeer(resuming){
-  const peer = new Peer(PREFIX + H.code);
+  const peer = new Peer(PREFIX + H.code, PEER_OPTS);
   H.peer = peer;
   peer.on("open", () => { H.retries = 0; hostSave(); renderHost(); startTick(); });
   peer.on("connection", conn => {
@@ -499,6 +504,7 @@ function playerStart(){
       <div style="font-weight:800;margin:16px 0 6px">Your first name + last initial</div>
       <input id="jname" maxlength="18" placeholder="e.g. Mateo R." value="${esc(name)}" autocomplete="off" autocapitalize="words">
       <button class="btn" style="width:100%;margin-top:20px;font-size:1.3rem" id="jbtn">Join game</button>
+      <div class="muted" id="jstat" style="margin-top:10px;color:#555;font-weight:600"></div>
       <div class="err" id="jerr"></div>
     </form>
     <button class="link" style="margin-top:28px" onclick="location.hash='host';location.reload()">Teacher: host a game</button>
@@ -515,22 +521,33 @@ function doJoin(){
   document.getElementById("jbtn").disabled = true; err.textContent = "";
   document.getElementById("jbtn").textContent = "Joining…";
   if (P.peer) { try{ P.peer.destroy(); }catch(e){} }
-  P.peer = new Peer();
+  P.peer = new Peer(PEER_OPTS);
+  jStatus("Connecting to game server…");
+  clearTimeout(P.jt); P.jt = setTimeout(joinTimeout, 25000);
   P.peer.on("open", playerConnect);
   P.peer.on("disconnected", () => { try{ P.peer.reconnect(); }catch(e){} });
   P.peer.on("error", e => {
     if (e.type === "peer-unavailable"){
       if (P.joined){ setTimeout(playerConnect, 2500); return; }
       const b = document.getElementById("jbtn"); if (b){ b.disabled=false; b.textContent="Join game"; }
-      const er = document.getElementById("jerr"); if (er) er.textContent = "No game found with code " + P.code + ". Check the board.";
+      jStatus(""); clearTimeout(P.jt); const er = document.getElementById("jerr"); if (er) er.textContent = "No game found with code " + P.code + ". Check the board.";
     } else if (!P.joined){
       const b = document.getElementById("jbtn"); if (b){ b.disabled=false; b.textContent="Join game"; }
-      const er = document.getElementById("jerr"); if (er) er.textContent = "Connection problem (" + e.type + "). Try again.";
+      jStatus(""); clearTimeout(P.jt); const er = document.getElementById("jerr"); if (er) er.textContent = "Connection problem (" + e.type + "). Try again.";
     } else setTimeout(playerConnect, 2500);
   });
 }
+function jStatus(t){ const e = document.getElementById("jstat"); if (e) e.textContent = t; }
+function joinTimeout(){
+  if (P.joined) return;
+  const b = document.getElementById("jbtn"); if (b){ b.disabled=false; b.textContent="Try again"; }
+  jStatus("");
+  const er = document.getElementById("jerr"); if (er) er.textContent = "Couldn’t reach the board. Check the code, make sure you’re online, and try again.";
+  try{ P.peer.destroy(); }catch(e){}
+}
 function playerConnect(){
   if (P.kicked) return;
+  if (!P.joined) jStatus("Found the server — connecting to game " + P.code + "…");
   if (P.conn) { try{ P.conn.close(); }catch(e){} }
   const conn = P.peer.connect(PREFIX + P.code, {reliable:true});
   P.conn = conn;
@@ -542,7 +559,7 @@ function onPlayerMsg(m){
   if (!m) return;
   if (m.t === "kicked"){ P.kicked = true; store.del("oh_last"); $app.innerHTML = `<div class="center"><h2>You were removed from the game.</h2><p class="muted">Ask your teacher, then join again with your real name.</p><button class="btn" onclick="location.reload()">Back</button></div>`; return; }
   if (m.t !== "state") return;
-  P.joined = true; P.st = m; showBanner(false);
+  P.joined = true; clearTimeout(P.jt); P.st = m; showBanner(false);
   if (P.pending && (m.round !== P.pending.round || m.myVote || m.phase !== "question")) P.pending = null;
   if (m.phase === "question" && m.secondsLeft != null) P.deadline = Date.now() + m.secondsLeft*1000;
   renderPlayer();
